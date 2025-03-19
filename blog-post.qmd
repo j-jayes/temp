@@ -1,0 +1,274 @@
+---
+title: "Share of Customs and Other Import Duties in Tax Revenue"
+format: html
+---
+
+## Purpose
+
+Alistair Campbell said today on The Rest Is Politics podcast titled [384. Labour’s War on Welfare, Trump’s Tariff Secret, and Britain’s Fight for Farming](https://open.spotify.com/episode/7eg2WcVMO0oULxrnuxaKhO?si=eb879c7f4c5944bf) that between 1798 and 1913, tariff income made up between 50% and 90% of the US federal income, and that today is it 1.57% and 70% of goods enter the US tariff free. I don't know about the veracity of this figure, but I wanted to make an animated plot to show how share of customs duties have fallen over time.
+
+### Data
+
+Data is sourced from the World Bank and includes the following indicators:
+
+- Customs and other import duties (% of tax revenue) data sourced from [World Bank](https://data.worldbank.org/indicator/GC.TAX.IMPT.ZS)
+- Tax revenue as a percentage of GDP data sourced from [World Bank](https://data.worldbank.org/indicator/GC.TAX.TOTL.GD.ZS)
+- GDP per capita data sourced from [World Bank](https://data.worldbank.org/indicator/NY.GDP.PCAP.PP.CD)
+- Population from [World Bank](https://data.worldbank.org/indicator/SP.POP.TOTL)
+
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(here)
+library(countrycode)
+library(gt)
+theme_set(theme_light())
+
+# Function to read and tidy World Bank data files
+tidy_wb_data <- function(filename, df_name) {
+    full_path <- here("data", filename)
+
+    df <- read_excel(full_path, skip = 3) %>%
+        janitor::clean_names() %>%
+        pivot_longer(
+            -c(country_name, country_code, indicator_name, indicator_code),
+            names_to = "year",
+            values_to = "value"
+        ) %>%
+        mutate(
+            year = parse_number(year),
+            data_source = df_name
+        )
+
+    return(df)
+}
+
+# Process each dataset
+customs_data <- tidy_wb_data("API_GC.TAX.IMPT.ZS_DS2_en_excel_v2_1229.xls", "customs")
+tax_rev_data <- tidy_wb_data("API_GC.TAX.TOTL.GD.ZS_DS2_en_excel_v2_114370.xls", "tax_revenue")
+gdp_pc_data <- tidy_wb_data("API_NY.GDP.PCAP.PP.CD_DS2_en_excel_v2_76307.xls", "gdp_per_capita")
+population_data <- tidy_wb_data("API_SP.POP.TOTL_DS2_en_excel_v2_76243.xls", "population")
+
+# Combine all datasets
+combined_data <- bind_rows(customs_data, tax_rev_data, gdp_pc_data, population_data)
+
+# Add country codes and regions for plotting
+combined_data <- combined_data %>%
+    mutate(
+        region = countrycode(country_code, "wb", "region"),
+        country_code_2 = countrycode(country_code, "wb", "iso2c")
+    )
+```
+
+Here we calculate the average of the 5 most recent non-missing values for each country and indicator. This is useful for understanding the most recent trends in the data.
+
+```{r}
+# Calculate average of 5 most recent non-missing values for each country and indicator
+recent_averages <- combined_data %>%
+    # Remove rows with missing values
+    filter(!is.na(value)) %>%
+    # Group by country and indicator
+    group_by(country_code_2, country_name, country_code, indicator_name, indicator_code, region, data_source) %>%
+    # Sort by year in descending order within each group
+    arrange(desc(year), .by_group = TRUE) %>%
+    # Take the 5 most recent observations for each group
+    slice_head(n = 5) %>%
+    # Calculate the average
+    summarize(
+        avg_value = mean(value, na.rm = TRUE),
+        earliest_year = min(year),
+        latest_year = max(year),
+        n_years = n(),
+        .groups = "drop"
+    ) %>%
+    # Add a note about the time period
+    mutate(time_period = paste0(earliest_year, "-", latest_year, " (", n_years, " years)"))
+
+```
+
+
+Here we make a table of the average values for the most recent 5 years for each country and indicator, arranged in descending order of customs and other import duties as a percentage of tax revenue. The table is formatted using the `gt` package so that I can add flags and format the numbers nicely.
+
+
+```{r}
+recent_averages %>%
+    filter(indicator_name != "Population, total") %>%
+    select(country_code_2, country_name, indicator_name, avg_value) %>%
+    pivot_wider(names_from = indicator_name, values_from = avg_value) %>%
+    arrange(desc(`Customs and other import duties (% of tax revenue)`)) %>%
+    filter(!is.na(`Customs and other import duties (% of tax revenue)`)) %>%
+    gt() %>%
+    fmt_number(
+        columns = c(
+            `Customs and other import duties (% of tax revenue)`,
+            `Tax revenue (% of GDP)`,
+            `GDP per capita, PPP (current international $)`
+        ),
+        decimals = 2
+    ) %>%
+    fmt_flag(
+        columns = "country_code_2",
+        # flags = "https://www.countryflags.io/.png"
+    ) %>%
+    cols_label(
+        country_code_2 = "",
+        country_name = "Country Name"
+    ) %>%
+    tab_header(
+        title = "Customs and other import duties (% of tax revenue)",
+        subtitle = "Data averaged over the 5 most recent years of non-missing data"
+    ) %>%
+    tab_source_note("Data sourced from World Bank")
+
+```
+
+Here we plot the relationship between GDP per capita and customs and other import duties as a percentage of tax revenue. The plot includes a smoothed line to show the trend, and points are sized by population. The countries with the largest populations are labeled.
+
+The problem is that it is difficult to pick out the USA. 
+
+```{r}
+# Plot relationship between GDP per capita and Customs and other import duties
+recent_averages %>%
+    filter(avg_value > 0.1) %>%
+    select(country_name, indicator_name, avg_value, region) %>%
+    pivot_wider(names_from = indicator_name, values_from = avg_value) %>%
+    janitor::clean_names() %>%
+    filter(!is.na(region)) %>%
+    # add a column called country_name_label that is the same as country_name but only there for the 20 largest countries by population_total
+    mutate(country_name_label = ifelse(rank(-population_total) <= 30, country_name, NA_character_)) %>%
+    ggplot(aes(x = gdp_per_capita_ppp_current_international, y = customs_and_other_import_duties_percent_of_tax_revenue)) +
+    geom_smooth(
+        # add a quadratic term to the model
+        method = "loess",
+        se = FALSE
+    ) +
+    geom_point(aes(size = population_total, colour = region)) +
+    geom_text(aes(label = country_name), check_overlap = TRUE, vjust = -0.1, hjust = -0.1) +
+    scale_x_log10(labels = scales::dollar_format(suffix = " GDP per capita")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1, scale = 1)) +
+    scale_size_continuous(labels = scales::comma, breaks = c(
+        1e6, 1e7, 1e8, 1e9
+    )) +
+    scale_colour_brewer(palette = "Set1") +
+    labs(
+        x = "GDP per capita (PPP, current international $)",
+        y = "Customs and other import duties (% of tax revenue)",
+        title = "Relationship between GDP per capita and Customs and other import duties",
+        caption = "Data sourced from World Bank",
+        size = "Population",
+        colour = "Region (World Bank)"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom"
+    ) +
+    guides(
+        colour = guide_legend(nrow = 4, title.position = "top", title.hjust = 0.5),
+        size = guide_legend(nrow = 4, title.position = "top", title.hjust = 0.5)
+    )
+
+```
+
+
+Here it is easier to see the USA, where we have added a log scale to the x-axis.
+
+
+```{r}
+# Plot relationship between GDP per capita and Customs and other import duties
+recent_averages %>%
+    select(country_name, indicator_name, avg_value, region) %>%
+    pivot_wider(names_from = indicator_name, values_from = avg_value) %>%
+    janitor::clean_names() %>%
+    filter(!is.na(region)) %>%
+    # add a column called country_name_label that is the same as country_name but only there for the 20 largest countries by population_total
+    mutate(country_name_label = ifelse(rank(-population_total) <= 30, country_name, NA_character_)) %>%
+    ggplot(aes(x = gdp_per_capita_ppp_current_international, y = customs_and_other_import_duties_percent_of_tax_revenue)) +
+    geom_smooth(
+        # add a quadratic term to the model
+        method = "loess",
+        se = FALSE
+    ) +
+    geom_point(aes(size = population_total, colour = region)) +
+    geom_text(aes(label = country_name_label), check_overlap = TRUE, vjust = -0.1, hjust = -0.1) +
+    scale_x_continuous(labels = scales::dollar_format(suffix = " GDP per capita")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1, scale = 1)) +
+    scale_size_continuous(labels = scales::comma, breaks = c(
+        1e6, 1e7, 1e8, 1e9
+    )) +
+    labs(
+        x = "GDP per capita (PPP, current international $)",
+        y = "Customs and other import duties (% of tax revenue)",
+        title = "Relationship between GDP per capita and Customs and other import duties",
+        caption = "Data sourced from World Bank",
+        size = "Population",
+        colour = "Region (World Bank)"
+    ) +
+    theme_minimal()
+
+```
+
+
+### Animated plot
+
+I am struggling with the animated plot, as I am missing the axis ticks as well as the labels.
+
+```{r}
+# Create and save the animation in one step
+df_animate <- combined_data %>%
+    select(country_name, indicator_name, value, region, year) %>%
+    pivot_wider(names_from = indicator_name, values_from = value) %>%
+    janitor::clean_names() %>%
+    filter(!is.na(region)) %>%
+    # Filter for years and countries with complete data
+    filter(
+        !is.na(gdp_per_capita_ppp_current_international),
+        !is.na(customs_and_other_import_duties_percent_of_tax_revenue),
+        !is.na(population_total)
+    ) %>%
+    # Add a column called country_name_label that is the same as country_name
+    # but only there for the 30 largest countries by population_total
+    group_by(year) %>%
+    mutate(country_name_label = ifelse(rank(-population_total) <= 30, country_name, NA_character_)) %>%
+    ungroup()
+
+```
+
+
+
+```{r}
+library(gganimate)
+
+p <- df_animate %>%
+    # Create the plot
+    ggplot(aes(
+        x = gdp_per_capita_ppp_current_international,
+        y = customs_and_other_import_duties_percent_of_tax_revenue
+    )) +
+    geom_smooth(
+        method = "lm",
+        se = FALSE
+    ) +
+    geom_point(aes(size = population_total, color = region)) +
+    labs(
+        x = "GDP per capita (PPP, current international $)",
+        y = "Customs and other import duties (% of tax revenue)",
+        title = "Since the introduction of the WTO, revenue from customs and other import duties have fallen \nas a share of tax revenue, and the world has become richer",
+        subtitle = "Year: {next_state}",
+        caption = "Data sourced from World Bank",
+        size = "Population",
+        color = "Region (World Bank)"
+    ) +
+    scale_color_brewer(palette = "Set1") +
+    scale_x_continuous(labels = scales::dollar_format(suffix = " GDP per capita")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1, scale = 1)) +
+    theme(legend.position = "bottom") +
+    # Animation components
+    transition_states(year, transition_length = 2, state_length = 1) +
+    enter_fade() +
+    exit_fade()
+
+animate(p, nframes = 200, fps = 10, width = 600, height = 400, renderer = gifski_renderer(file = "tariffs.gif"))
+```
+
+![tariffs.gif](tariffs.gif)
